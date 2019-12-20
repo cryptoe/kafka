@@ -48,7 +48,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -236,13 +235,13 @@ public class ConsumerNetworkClientTest {
 
     @Test
     public void testAuthenticationExceptionPropagatedFromMetadata() {
-        metadata.failedUpdate(time.milliseconds(), new AuthenticationException("Authentication failed"));
+        metadata.fatalError(new AuthenticationException("Authentication failed"));
         try {
             consumerClient.poll(time.timer(Duration.ZERO));
             fail("Expected authentication error thrown");
         } catch (AuthenticationException e) {
             // After the exception is raised, it should have been cleared
-            assertNull(metadata.getAndClearMetadataException());
+            metadata.maybeThrowAnyException();
         }
     }
 
@@ -265,7 +264,7 @@ public class ConsumerNetworkClientTest {
     @Test
     public void testMetadataFailurePropagated() {
         KafkaException metadataException = new KafkaException();
-        metadata.failedUpdate(time.milliseconds(), metadataException);
+        metadata.fatalError(metadataException);
         try {
             consumerClient.poll(time.timer(Duration.ZERO));
             fail("Expected poll to throw exception");

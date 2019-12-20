@@ -16,10 +16,10 @@
  */
 package kafka.cluster
 
-import java.util.{Optional, Properties}
-import java.util.concurrent.locks.ReentrantReadWriteLock
-
 import com.yammer.metrics.core.Gauge
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import java.util.{Optional, Properties}
+
 import kafka.api.{ApiVersion, LeaderAndIsr, Request}
 import kafka.common.UnexpectedAppendOffsetException
 import kafka.controller.KafkaController
@@ -30,8 +30,9 @@ import kafka.server.checkpoints.OffsetCheckpoints
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
 import kafka.utils._
 import kafka.zk.{AdminZkClient, KafkaZkClient}
-import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.{IsolationLevel, TopicPartition}
 import org.apache.kafka.common.errors._
+import org.apache.kafka.common.message.LeaderAndIsrRequestData.LeaderAndIsrPartitionState
 import org.apache.kafka.common.protocol.Errors
 import org.apache.kafka.common.protocol.Errors._
 import org.apache.kafka.common.record.FileRecords.TimestampAndOffset
@@ -41,7 +42,7 @@ import org.apache.kafka.common.requests._
 import org.apache.kafka.common.utils.Time
 
 import scala.collection.JavaConverters._
-import scala.collection.Map
+import scala.collection.{Map, Seq}
 
 trait PartitionStateStore {
   def fetchTopicConfig(): Properties
@@ -154,18 +155,35 @@ object Partition extends KafkaMetricsGroup {
   }
 }
 
+
+sealed trait AssignmentState {
+  def replicas: Seq[Int]
+  def replicationFactor: Int = replicas.size
+  def isAddingReplica(brokerId: Int): Boolean = false
+}
+
+case class OngoingReassignmentState(addingReplicas: Seq[Int],
+                                    removingReplicas: Seq[Int],
+                                    replicas: Seq[Int]) extends AssignmentState {
+
+  override def replicationFactor: Int = replicas.diff(addingReplicas).size // keep the size of the original replicas
+  override def isAddingReplica(replicaId: Int): Boolean = addingReplicas.contains(replicaId)
+}
+
+case class SimpleAssignmentState(replicas: Seq[Int]) extends AssignmentState
+
 /**
  * Data structure that represents a topic partition. The leader maintains the AR, ISR, CUR, RAR
  */
 class Partition(val topicPartition: TopicPartition,
-                private val replicaLagTimeMaxMs: Long,
-                private val interBrokerProtocolVersion: ApiVersion,
-                private val localBrokerId: Int,
-                private val time: Time,
-                private val stateStore: PartitionStateStore,
-                private val delayedOperations: DelayedOperations,
-                private val metadataCache: MetadataCache,
-                private val logManager: LogManager) extends Logging with KafkaMetricsGroup {
+                val replicaLagTimeMaxMs: Long,
+                interBrokerProtocolVersion: ApiVersion,
+                localBrokerId: Int,
+                time: Time,
+                stateStore: PartitionStateStore,
+                delayedOperations: DelayedOperations,
+                metadataCache: MetadataCache,
+                logManager: LogManager) extends Logging with KafkaMetricsGroup {
 
   def topic: String = topicPartition.topic
   def partitionId: Int = topicPartition.partition
@@ -179,10 +197,8 @@ class Partition(val topicPartition: TopicPartition,
   // defined when this broker is leader for partition
   @volatile private var leaderEpochStartOffsetOpt: Option[Long] = None
   @volatile var leaderReplicaIdOpt: Option[Int] = None
-  @volatile var inSyncReplicas: Set[Int] = Set.empty[Int]
-  // Includes all valid broker ids (@see Request::isValidBrokerId) that contain logs. Doesn't contain
-  // future log replica id
-  @volatile var allReplicaIds: scala.collection.mutable.Set[Int] = scala.collection.mutable.Set(localBrokerId)
+  @volatile var inSyncReplicaIds = Set.empty[Int]
+  @volatile var assignmentState: AssignmentState = SimpleAssignmentState(Seq.empty)
 
   // Logs belonging to this partition. Majority of time it will be only one log, but if log directory
   // is getting changed (as a result of ReplicaAlterLogDirs command), we may have two logs until copy
@@ -214,7 +230,7 @@ class Partition(val topicPartition: TopicPartition,
   newGauge("InSyncReplicasCount",
     new Gauge[Int] {
       def value: Int = {
-        if (isLeader) inSyncReplicas.size else 0
+        if (isLeader) inSyncReplicaIds.size else 0
       }
     },
     tags
@@ -241,7 +257,7 @@ class Partition(val topicPartition: TopicPartition,
   newGauge("ReplicasCount",
     new Gauge[Int] {
       def value: Int = {
-        if (isLeader) allReplicaIds.size else 0
+        if (isLeader) assignmentState.replicationFactor else 0
       }
     },
     tags
@@ -256,16 +272,21 @@ class Partition(val topicPartition: TopicPartition,
     tags
   )
 
-  def isUnderReplicated: Boolean =
-    isLeader && inSyncReplicas.size < allReplicaIds.size
+  def isUnderReplicated: Boolean = isLeader && (assignmentState.replicationFactor - inSyncReplicaIds.size) > 0
 
   def isUnderMinIsr: Boolean = {
-    leaderLogIfLocal.exists { inSyncReplicas.size < _.config.minInSyncReplicas }
+    leaderLogIfLocal.exists { inSyncReplicaIds.size < _.config.minInSyncReplicas }
   }
 
   def isAtMinIsr: Boolean = {
-    leaderLogIfLocal.exists { inSyncReplicas.size == _.config.minInSyncReplicas }
+    leaderLogIfLocal.exists { inSyncReplicaIds.size == _.config.minInSyncReplicas }
   }
+
+  def isReassigning: Boolean = assignmentState.isInstanceOf[OngoingReassignmentState]
+
+  def isAddingLocalReplica: Boolean = assignmentState.isAddingReplica(localBrokerId)
+
+  def isAddingReplica(replicaId: Int): Boolean = assignmentState.isAddingReplica(replicaId)
 
   /**
     * Create the future replica if 1) the current replica is not in the given log directory and 2) the future replica
@@ -301,19 +322,6 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
-  /**
-   * Creates a remote replica and puts that in a map. A future invocation to create
-   * replica with same id will return previously created object.
-   */
-  def getOrCreateReplica(replicaId: Int): Replica = {
-    require(replicaId != localBrokerId, s"Cannot create replica for local broker: $replicaId")
-    val newReplica = remoteReplicasMap.getAndMaybePut(replicaId, new Replica(replicaId, topicPartition))
-    allReplicaIds.add(replicaId)
-    require(remoteReplicasMap.size + 1 == allReplicaIds.size,
-      s"Invalid state. All Replica Ids: $allReplicaIds, remote replica ids: ${remoteReplicasMap.keys}")
-    newReplica
-  }
-
   def createLogIfNotExists(replicaId: Int, isNew: Boolean, isFutureReplica: Boolean, offsetCheckpoints: OffsetCheckpoints): Unit = {
     isFutureReplica match {
       case true if futureLog.isEmpty =>
@@ -326,19 +334,28 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
-  private def createLog(replicaId: Int, isNew: Boolean, isFutureReplica: Boolean, offsetCheckpoints: OffsetCheckpoints): Log = {
-    val props = stateStore.fetchTopicConfig()
-    val config = LogConfig.fromProps(logManager.currentDefaultConfig.originals, props)
-    val log = logManager.getOrCreateLog(topicPartition, config, isNew, isFutureReplica)
-    val checkpointHighWatermark = offsetCheckpoints.fetch(log.dir.getParent, topicPartition).getOrElse {
-      info(s"No checkpointed highwatermark is found for partition $topicPartition")
-      0L
+  // Visible for testing
+  private[cluster] def createLog(replicaId: Int, isNew: Boolean, isFutureReplica: Boolean, offsetCheckpoints: OffsetCheckpoints): Log = {
+    val fetchLogConfig = () => {
+      val props = stateStore.fetchTopicConfig()
+      LogConfig.fromProps(logManager.currentDefaultConfig.originals, props)
     }
-    val initialHighWatermark = math.min(checkpointHighWatermark, log.logEndOffset)
-    log.highWatermarkMetadata = LogOffsetMetadata(initialHighWatermark)
 
-    info(s"Log loaded for partition $topicPartition with initial high watermark $initialHighWatermark")
-    log
+    logManager.initializingLog(topicPartition)
+    var maybeLog: Option[Log] = None
+    try {
+      val log = logManager.getOrCreateLog(topicPartition, fetchLogConfig(), isNew, isFutureReplica)
+      val checkpointHighWatermark = offsetCheckpoints.fetch(log.dir.getParent, topicPartition).getOrElse {
+        info(s"No checkpointed highwatermark is found for partition $topicPartition")
+        0L
+      }
+      val initialHighWatermark = log.updateHighWatermark(checkpointHighWatermark)
+      info(s"Log loaded for partition $topicPartition with initial high watermark $initialHighWatermark")
+      maybeLog = Some(log)
+      log
+    } finally {
+      logManager.finishedInitializingLog(topicPartition, maybeLog, fetchLogConfig)
+    }
   }
 
   def getReplica(replicaId: Int): Option[Replica] = Option(remoteReplicasMap.get(replicaId))
@@ -414,12 +431,6 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
-  // Visible for testing -- Only used in tests to add replica to existing partition
-  def addReplicaIfNotExists(replica: Replica): Replica = {
-    allReplicaIds.add(replica.brokerId)
-    remoteReplicasMap.getAndMaybePut(replica.brokerId, replica)
-  }
-
   // Visible for testing -- Used by unit tests to set log for this partition
   def setLog(log: Log, isFutureLog: Boolean): Unit = {
     if (isFutureLog)
@@ -428,14 +439,9 @@ class Partition(val topicPartition: TopicPartition,
       this.log = Some(log)
   }
 
-  def remoteReplicas: Set[Replica] =
-    remoteReplicasMap.values.toSet
-
-  private def removeReplica(replicaId: Int) {
-    require(replicaId != localBrokerId, s"Cannot remove replica for local broker: $replicaId")
-    allReplicaIds.remove(replicaId)
-    remoteReplicasMap.remove(replicaId)
-  }
+  // remoteReplicas will be called in the hot path, and must be inexpensive
+  def remoteReplicas: Iterable[Replica] =
+    remoteReplicasMap.values
 
   def futureReplicaDirChanged(newDestinationDir: String): Boolean = {
     inReadLock(leaderIsrUpdateLock) {
@@ -443,7 +449,7 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
-  def removeFutureLocalReplica(deleteFromLogDir: Boolean = true) {
+  def removeFutureLocalReplica(deleteFromLogDir: Boolean = true): Unit = {
     inWriteLock(leaderIsrUpdateLock) {
       futureLog = None
       if (deleteFromLogDir)
@@ -480,14 +486,14 @@ class Partition(val topicPartition: TopicPartition,
     } else false
   }
 
-  def delete() {
+  def delete(): Unit = {
     // need to hold the lock to prevent appendMessagesToLeader() from hitting I/O exceptions due to log being deleted
     inWriteLock(leaderIsrUpdateLock) {
       remoteReplicasMap.clear()
-      allReplicaIds = scala.collection.mutable.Set(localBrokerId)
+      assignmentState = SimpleAssignmentState(Seq.empty)
       log = None
       futureLog = None
-      inSyncReplicas = Set.empty[Int]
+      inSyncReplicaIds = Set.empty
       leaderReplicaIdOpt = None
       leaderEpochStartOffsetOpt = None
       Partition.removeMetrics(topicPartition)
@@ -505,34 +511,31 @@ class Partition(val topicPartition: TopicPartition,
    * If the leader replica id does not change, return false to indicate the replica manager.
    */
   def makeLeader(controllerId: Int,
-                 partitionStateInfo: LeaderAndIsrRequest.PartitionState,
+                 partitionState: LeaderAndIsrPartitionState,
                  correlationId: Int,
                  highWatermarkCheckpoints: OffsetCheckpoints): Boolean = {
     val (leaderHWIncremented, isNewLeader) = inWriteLock(leaderIsrUpdateLock) {
       // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
       // to maintain the decision maker controller's epoch in the zookeeper path
-      controllerEpoch = partitionStateInfo.basePartitionState.controllerEpoch
-      // add replicas that are new
-      val newInSyncReplicas = partitionStateInfo.basePartitionState.isr.asScala.map(_.toInt)
-      newInSyncReplicas.filter(_ != localBrokerId).foreach(getOrCreateReplica)
-      inSyncReplicas = newInSyncReplicas.toSet
+      controllerEpoch = partitionState.controllerEpoch
 
-      // remove assigned replicas that have been removed by the controller
-      val newAssignedReplicas = partitionStateInfo.basePartitionState.replicas.asScala.map(_.toInt)
-      (remoteReplicasMap.keys -- newAssignedReplicas).foreach(removeReplica)
-      newAssignedReplicas.filter(_ != localBrokerId).foreach(getOrCreateReplica)
-
-      createLogIfNotExists(localBrokerId, partitionStateInfo.isNew, isFutureReplica = false, highWatermarkCheckpoints)
+      updateAssignmentAndIsr(
+        assignment = partitionState.replicas.asScala.map(_.toInt),
+        isr = partitionState.isr.asScala.map(_.toInt).toSet,
+        addingReplicas = partitionState.addingReplicas.asScala.map(_.toInt),
+        removingReplicas = partitionState.removingReplicas.asScala.map(_.toInt)
+      )
+      createLogIfNotExists(localBrokerId, partitionState.isNew, isFutureReplica = false, highWatermarkCheckpoints)
 
       val leaderLog = localLogOrException
       val leaderEpochStartOffset = leaderLog.logEndOffset
-      info(s"$topicPartition starts at Leader Epoch ${partitionStateInfo.basePartitionState.leaderEpoch} from " +
+      info(s"$topicPartition starts at Leader Epoch ${partitionState.leaderEpoch} from " +
         s"offset $leaderEpochStartOffset. Previous Leader Epoch was: $leaderEpoch")
 
       //We cache the leader epoch here, persisting it only if it's local (hence having a log dir)
-      leaderEpoch = partitionStateInfo.basePartitionState.leaderEpoch
+      leaderEpoch = partitionState.leaderEpoch
       leaderEpochStartOffsetOpt = Some(leaderEpochStartOffset)
-      zkVersion = partitionStateInfo.basePartitionState.zkVersion
+      zkVersion = partitionState.zkVersion
 
       // In the case of successive leader elections in a short time period, a follower may have
       // entries in its log from a later epoch than any entry in the new leader's log. In order
@@ -546,22 +549,21 @@ class Partition(val topicPartition: TopicPartition,
       val curTimeMs = time.milliseconds
       // initialize lastCaughtUpTime of replicas as well as their lastFetchTimeMs and lastFetchLeaderLogEndOffset.
       remoteReplicas.foreach { replica =>
-        val lastCaughtUpTimeMs = if (inSyncReplicas.contains(replica.brokerId)) curTimeMs else 0L
+        val lastCaughtUpTimeMs = if (inSyncReplicaIds.contains(replica.brokerId)) curTimeMs else 0L
         replica.resetLastCaughtUpTime(curLeaderLogEndOffset, curTimeMs, lastCaughtUpTimeMs)
       }
 
       if (isNewLeader) {
-        // construct the high watermark metadata for the new leader replica
-        leaderLog.maybeFetchHighWatermarkOffsetMetadata()
         // mark local replica as the leader after converting hw
         leaderReplicaIdOpt = Some(localBrokerId)
         // reset log end offset for remote replicas
-        remoteReplicas.foreach { _.updateFetchState(
+        remoteReplicas.foreach { replica =>
+          replica.updateFetchState(
             followerFetchOffsetMetadata = LogOffsetMetadata.UnknownOffsetMetadata,
             followerStartOffset = Log.UnknownOffset,
             followerFetchTimeMs = 0L,
-            leaderEndOffset = Log.UnknownOffset
-          )
+            leaderEndOffset = Log.UnknownOffset,
+            lastSentHighwatermark = 0L)
         }
       }
       // we may need to increment high watermark since ISR could be down to 1
@@ -580,26 +582,27 @@ class Partition(val topicPartition: TopicPartition,
     * replica manager that state is already correct and the become-follower steps can be skipped
    */
   def makeFollower(controllerId: Int,
-                   partitionStateInfo: LeaderAndIsrRequest.PartitionState,
+                   partitionState: LeaderAndIsrPartitionState,
                    correlationId: Int,
                    highWatermarkCheckpoints: OffsetCheckpoints): Boolean = {
     inWriteLock(leaderIsrUpdateLock) {
-      val newAssignedReplicas = partitionStateInfo.basePartitionState.replicas.asScala.map(_.toInt)
-      val newLeaderBrokerId = partitionStateInfo.basePartitionState.leader
+      val newLeaderBrokerId = partitionState.leader
       val oldLeaderEpoch = leaderEpoch
       // record the epoch of the controller that made the leadership decision. This is useful while updating the isr
       // to maintain the decision maker controller's epoch in the zookeeper path
-      controllerEpoch = partitionStateInfo.basePartitionState.controllerEpoch
-      // add replicas that are new
-      newAssignedReplicas.filter(_ != localBrokerId).foreach(id => getOrCreateReplica(id))
-      createLogIfNotExists(localBrokerId, partitionStateInfo.isNew, isFutureReplica = false, highWatermarkCheckpoints)
+      controllerEpoch = partitionState.controllerEpoch
 
-      // remove assigned replicas that have been removed by the controller
-      (remoteReplicasMap.keys -- newAssignedReplicas).foreach(removeReplica)
-      inSyncReplicas = Set.empty[Int]
-      leaderEpoch = partitionStateInfo.basePartitionState.leaderEpoch
+      updateAssignmentAndIsr(
+        assignment = partitionState.replicas.asScala.iterator.map(_.toInt).toSeq,
+        isr = Set.empty[Int],
+        addingReplicas = partitionState.addingReplicas.asScala.map(_.toInt),
+        removingReplicas = partitionState.removingReplicas.asScala.map(_.toInt)
+      )
+      createLogIfNotExists(localBrokerId, partitionState.isNew, isFutureReplica = false, highWatermarkCheckpoints)
+
+      leaderEpoch = partitionState.leaderEpoch
       leaderEpochStartOffsetOpt = None
-      zkVersion = partitionStateInfo.basePartitionState.zkVersion
+      zkVersion = partitionState.zkVersion
 
       if (leaderReplicaIdOpt.contains(newLeaderBrokerId) && leaderEpoch == oldLeaderEpoch) {
         false
@@ -620,37 +623,82 @@ class Partition(val topicPartition: TopicPartition,
                                followerFetchOffsetMetadata: LogOffsetMetadata,
                                followerStartOffset: Long,
                                followerFetchTimeMs: Long,
-                               leaderEndOffset: Long): Boolean = {
-
+                               leaderEndOffset: Long,
+                               lastSentHighwatermark: Long): Boolean = {
     getReplica(followerId) match {
       case Some(followerReplica) =>
         // No need to calculate low watermark if there is no delayed DeleteRecordsRequest
         val oldLeaderLW = if (delayedOperations.numDelayedDelete > 0) lowWatermarkIfLeader else -1L
+        val prevFollowerEndOffset = followerReplica.logEndOffset
         followerReplica.updateFetchState(
           followerFetchOffsetMetadata,
           followerStartOffset,
           followerFetchTimeMs,
-          leaderEndOffset)
+          leaderEndOffset,
+          lastSentHighwatermark)
+
         val newLeaderLW = if (delayedOperations.numDelayedDelete > 0) lowWatermarkIfLeader else -1L
         // check if the LW of the partition has incremented
         // since the replica's logStartOffset may have incremented
         val leaderLWIncremented = newLeaderLW > oldLeaderLW
+
         // check if we need to expand ISR to include this replica
         // if it is not in the ISR yet
-        val followerFetchOffset = followerFetchOffsetMetadata.messageOffset
-        val leaderHWIncremented = maybeExpandIsr(followerReplica, followerFetchTimeMs)
+        if (!inSyncReplicaIds.contains(followerId))
+          maybeExpandIsr(followerReplica, followerFetchTimeMs)
+
+        // check if the HW of the partition can now be incremented
+        // since the replica may already be in the ISR and its LEO has just incremented
+        val leaderHWIncremented = if (prevFollowerEndOffset != followerReplica.logEndOffset) {
+          leaderLogIfLocal.exists(leaderLog => maybeIncrementLeaderHW(leaderLog, followerFetchTimeMs))
+        } else {
+          false
+        }
 
         // some delayed operations may be unblocked after HW or LW changed
         if (leaderLWIncremented || leaderHWIncremented)
           tryCompleteDelayedRequests()
 
         debug(s"Recorded replica $followerId log end offset (LEO) position " +
-          s"$followerFetchOffset and log start offset $followerStartOffset.")
+          s"${followerFetchOffsetMetadata.messageOffset} and log start offset $followerStartOffset.")
         true
 
       case None =>
         false
     }
+  }
+
+  /**
+   * Stores the topic partition assignment and ISR.
+   * It creates a new Replica object for any new remote broker. The isr parameter is
+   * expected to be a subset of the assignment parameter.
+   *
+   * Note: public visibility for tests.
+   *
+   * @param assignment An ordered sequence of all the broker ids that were assigned to this
+   *                   topic partition
+   * @param isr The set of broker ids that are known to be insync with the leader
+   * @param addingReplicas An ordered sequence of all broker ids that will be added to the
+    *                       assignment
+   * @param removingReplicas An ordered sequence of all broker ids that will be removed from
+    *                         the assignment
+   */
+  def updateAssignmentAndIsr(assignment: Seq[Int],
+                             isr: Set[Int],
+                             addingReplicas: Seq[Int],
+                             removingReplicas: Seq[Int]): Unit = {
+    val replicaSet = assignment.toSet
+    val removedReplicas = remoteReplicasMap.keys -- replicaSet
+
+    assignment
+      .filter(_ != localBrokerId)
+      .foreach(id => remoteReplicasMap.getAndMaybePut(id, new Replica(id, topicPartition)))
+    removedReplicas.foreach(remoteReplicasMap.remove)
+    if (addingReplicas.nonEmpty || removingReplicas.nonEmpty)
+      assignmentState = OngoingReassignmentState(addingReplicas, removingReplicas, assignment)
+    else
+      assignmentState = SimpleAssignmentState(assignment)
+    inSyncReplicaIds = isr
   }
 
   /**
@@ -666,27 +714,20 @@ class Partition(val topicPartition: TopicPartition,
    * whether a replica is in-sync, we only check HW.
    *
    * This function can be triggered when a replica's LEO has incremented.
-   *
-   * @return true if the high watermark has been updated
    */
-  private def maybeExpandIsr(followerReplica: Replica, followerFetchTimeMs: Long): Boolean = {
+  private def maybeExpandIsr(followerReplica: Replica, followerFetchTimeMs: Long): Unit = {
     inWriteLock(leaderIsrUpdateLock) {
       // check if this replica needs to be added to the ISR
-      leaderLogIfLocal match {
-        case Some(leaderLog) =>
-          val leaderHighwatermark = leaderLog.highWatermark
-          if (!inSyncReplicas.contains(followerReplica.brokerId) && isFollowerInSync(followerReplica, leaderHighwatermark)) {
-            val newInSyncReplicas = inSyncReplicas + followerReplica.brokerId
-            info(s"Expanding ISR from ${inSyncReplicas.mkString(",")} " +
-              s"to ${newInSyncReplicas.mkString(",")}")
+      leaderLogIfLocal.foreach { leaderLog =>
+        val leaderHighwatermark = leaderLog.highWatermark
+        if (!inSyncReplicaIds.contains(followerReplica.brokerId) && isFollowerInSync(followerReplica, leaderHighwatermark)) {
+          val newInSyncReplicaIds = inSyncReplicaIds + followerReplica.brokerId
+          info(s"Expanding ISR from ${inSyncReplicaIds.mkString(",")} " +
+            s"to ${newInSyncReplicaIds.mkString(",")}")
 
-            // update ISR in ZK and cache
-            expandIsr(newInSyncReplicas)
-          }
-          // check if the HW of the partition can now be incremented
-          // since the replica may already be in the ISR and its LEO has just incremented
-          maybeIncrementLeaderHW(leaderLog, followerFetchTimeMs)
-        case None => false // nothing to do if no longer leader
+          // update ISR in ZK and cache
+          expandIsr(newInSyncReplicaIds)
+        }
       }
     }
   }
@@ -708,14 +749,14 @@ class Partition(val topicPartition: TopicPartition,
     leaderLogIfLocal match {
       case Some(leaderLog) =>
         // keep the current immutable replica list reference
-        val curInSyncReplicas = inSyncReplicas
+        val curInSyncReplicaIds = inSyncReplicaIds
 
         if (isTraceEnabled) {
           def logEndOffsetString: ((Int, Long)) => String = {
             case (brokerId, logEndOffset) => s"broker $brokerId: $logEndOffset"
           }
 
-          val curInSyncReplicaObjects = (curInSyncReplicas - localBrokerId).map(getReplicaOrException)
+          val curInSyncReplicaObjects = (curInSyncReplicaIds - localBrokerId).map(getReplicaOrException)
           val replicaInfo = curInSyncReplicaObjects.map(replica => (replica.brokerId, replica.logEndOffset))
           val localLogInfo = (localBrokerId, localLogOrException.logEndOffset)
           val (ackedReplicas, awaitingReplicas) = (replicaInfo + localLogInfo).partition { _._2 >= requiredOffset}
@@ -731,7 +772,7 @@ class Partition(val topicPartition: TopicPartition,
            * The topic may be configured not to accept messages if there are not enough replicas in ISR
            * in this scenario the request was already appended locally and then added to the purgatory before the ISR was shrunk
            */
-          if (minIsr <= curInSyncReplicas.size)
+          if (minIsr <= curInSyncReplicaIds.size)
             (true, Errors.NONE)
           else
             (true, Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND)
@@ -761,29 +802,35 @@ class Partition(val topicPartition: TopicPartition,
    * since all callers of this private API acquire that lock
    */
   private def maybeIncrementLeaderHW(leaderLog: Log, curTime: Long = time.milliseconds): Boolean = {
-    val replicaLogEndOffsets = remoteReplicas.filter { replica =>
-      curTime - replica.lastCaughtUpTimeMs <= replicaLagTimeMaxMs || inSyncReplicas.contains(replica.brokerId)
-    }.map(_.logEndOffsetMetadata)
-    val newHighWatermark = (replicaLogEndOffsets + leaderLog.logEndOffsetMetadata).min(new LogOffsetMetadata.OffsetOrdering)
-    val oldHighWatermark = leaderLog.highWatermarkMetadata
-
-    // Ensure that the high watermark increases monotonically. We also update the high watermark when the new
-    // offset metadata is on a newer segment, which occurs whenever the log is rolled to a new segment.
-    if (oldHighWatermark.messageOffset < newHighWatermark.messageOffset ||
-      (oldHighWatermark.messageOffset == newHighWatermark.messageOffset && oldHighWatermark.onOlderSegment(newHighWatermark))) {
-      leaderLog.highWatermarkMetadata = newHighWatermark
-      debug(s"High watermark updated to $newHighWatermark")
-      true
-    } else {
-      def logEndOffsetString: ((Int, LogOffsetMetadata)) => String = {
-        case (brokerId, logEndOffsetMetadata) => s"replica $brokerId: $logEndOffsetMetadata"
+    inReadLock(leaderIsrUpdateLock) {
+      // maybeIncrementLeaderHW is in the hot path, the following code is written to
+      // avoid unnecessary collection generation
+      var newHighWatermark = leaderLog.logEndOffsetMetadata
+      remoteReplicasMap.values.foreach { replica =>
+        if (replica.logEndOffsetMetadata.messageOffset < newHighWatermark.messageOffset &&
+          (curTime - replica.lastCaughtUpTimeMs <= replicaLagTimeMaxMs || inSyncReplicaIds.contains(replica.brokerId))) {
+          newHighWatermark = replica.logEndOffsetMetadata
+        }
       }
 
-      val replicaInfo = remoteReplicas.map(replica => (replica.brokerId, replica.logEndOffsetMetadata))
-      val localLogInfo = (localBrokerId, localLogOrException.logEndOffsetMetadata)
-      trace(s"Skipping update high watermark since new hw $newHighWatermark is not larger than old hw $oldHighWatermark. " +
-        s"All current LEOs are ${(replicaInfo + localLogInfo).map(logEndOffsetString)}")
-      false
+      leaderLog.maybeIncrementHighWatermark(newHighWatermark) match {
+        case Some(oldHighWatermark) =>
+          debug(s"High watermark updated from $oldHighWatermark to $newHighWatermark")
+          true
+
+        case None =>
+          def logEndOffsetString: ((Int, LogOffsetMetadata)) => String = {
+            case (brokerId, logEndOffsetMetadata) => s"replica $brokerId: $logEndOffsetMetadata"
+          }
+
+          if (isTraceEnabled) {
+            val replicaInfo = remoteReplicas.map(replica => (replica.brokerId, replica.logEndOffsetMetadata)).toSet
+            val localLogInfo = (localBrokerId, localLogOrException.logEndOffsetMetadata)
+            trace(s"Skipping update high watermark since new hw $newHighWatermark is not larger than old value. " +
+              s"All current LEOs are ${(replicaInfo + localLogInfo).map(logEndOffsetString)}")
+          }
+          false
+      }
     }
   }
 
@@ -795,15 +842,21 @@ class Partition(val topicPartition: TopicPartition,
   def lowWatermarkIfLeader: Long = {
     if (!isLeader)
       throw new NotLeaderForPartitionException(s"Leader not local for partition $topicPartition on broker $localBrokerId")
-    val logStartOffsets = remoteReplicas.collect {
-      case replica if metadataCache.isBrokerAlive(replica.brokerId) => replica.logStartOffset
-    } + localLogOrException.logStartOffset
+
+    // lowWatermarkIfLeader may be called many times when a DeleteRecordsRequest is outstanding,
+    // care has been taken to avoid generating unnecessary collections in this code
+    var lowWaterMark = localLogOrException.logStartOffset
+    remoteReplicas.foreach { replica =>
+      if (metadataCache.getAliveBroker(replica.brokerId).nonEmpty && replica.logStartOffset < lowWaterMark) {
+        lowWaterMark = replica.logStartOffset
+      }
+    }
 
     futureLog match {
       case Some(partitionFutureLog) =>
-        CoreUtils.min(logStartOffsets + partitionFutureLog.logStartOffset, 0L)
+        Math.min(lowWaterMark, partitionFutureLog.logStartOffset)
       case None =>
-        CoreUtils.min(logStartOffsets, 0L)
+        lowWaterMark
     }
   }
 
@@ -812,27 +865,27 @@ class Partition(val topicPartition: TopicPartition,
    */
   private def tryCompleteDelayedRequests(): Unit = delayedOperations.checkAndCompleteAll()
 
-  def maybeShrinkIsr(replicaMaxLagTimeMs: Long): Unit = {
+  def maybeShrinkIsr(): Unit = {
     val leaderHWIncremented = inWriteLock(leaderIsrUpdateLock) {
       leaderLogIfLocal match {
         case Some(leaderLog) =>
-          val outOfSyncReplicas = getOutOfSyncReplicas(replicaMaxLagTimeMs)
-          if (outOfSyncReplicas.nonEmpty) {
-            val newInSyncReplicas = inSyncReplicas -- outOfSyncReplicas
-            assert(newInSyncReplicas.nonEmpty)
+          val outOfSyncReplicaIds = getOutOfSyncReplicas(replicaLagTimeMaxMs)
+          if (outOfSyncReplicaIds.nonEmpty) {
+            val newInSyncReplicaIds = inSyncReplicaIds -- outOfSyncReplicaIds
+            assert(newInSyncReplicaIds.nonEmpty)
             info("Shrinking ISR from %s to %s. Leader: (highWatermark: %d, endOffset: %d). Out of sync replicas: %s."
-              .format(inSyncReplicas.mkString(","),
-                newInSyncReplicas.mkString(","),
+              .format(inSyncReplicaIds.mkString(","),
+                newInSyncReplicaIds.mkString(","),
                 leaderLog.highWatermark,
                 leaderLog.logEndOffset,
-                outOfSyncReplicas.map { replicaId =>
+                outOfSyncReplicaIds.map { replicaId =>
                   s"(brokerId: $replicaId, endOffset: ${getReplicaOrException(replicaId).logEndOffset})"
                 }.mkString(" ")
               )
             )
 
             // update ISR in zk and in cache
-            shrinkIsr(newInSyncReplicas)
+            shrinkIsr(newInSyncReplicaIds)
 
             // we may need to increment high watermark since ISR could be down to 1
             maybeIncrementLeaderHW(leaderLog)
@@ -871,10 +924,10 @@ class Partition(val topicPartition: TopicPartition,
      * is violated, that replica is considered to be out of sync
      *
      **/
-    val candidateReplicas = inSyncReplicas - localBrokerId
+    val candidateReplicaIds = inSyncReplicaIds - localBrokerId
     val currentTimeMs = time.milliseconds()
     val leaderEndOffset = localLogOrException.logEndOffset
-    candidateReplicas.filter(replicaId => isFollowerOutOfSync(replicaId, leaderEndOffset, currentTimeMs, maxLagMs))
+    candidateReplicaIds.filter(replicaId => isFollowerOutOfSync(replicaId, leaderEndOffset, currentTimeMs, maxLagMs))
   }
 
   private def doAppendRecordsToFollowerOrFutureReplica(records: MemoryRecords, isFuture: Boolean): Option[LogAppendInfo] = {
@@ -924,11 +977,11 @@ class Partition(val topicPartition: TopicPartition,
       leaderLogIfLocal match {
         case Some(leaderLog) =>
           val minIsr = leaderLog.config.minInSyncReplicas
-          val inSyncSize = inSyncReplicas.size
+          val inSyncSize = inSyncReplicaIds.size
 
           // Avoid writing to leader if there are not enough insync replicas to make it safe
           if (inSyncSize < minIsr && requiredAcks == -1) {
-            throw new NotEnoughReplicasException(s"The size of the current ISR $inSyncReplicas " +
+            throw new NotEnoughReplicasException(s"The size of the current ISR $inSyncReplicaIds " +
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition")
           }
 
@@ -964,25 +1017,13 @@ class Partition(val topicPartition: TopicPartition,
     // decide whether to only fetch from leader
     val localLog = localLogWithEpochOrException(currentLeaderEpoch, fetchOnlyFromLeader)
 
-    /* Read the LogOffsetMetadata prior to performing the read from the log.
-     * We use the LogOffsetMetadata to determine if a particular replica is in-sync or not.
-     * Using the log end offset after performing the read can lead to a race condition
-     * where data gets appended to the log immediately after the replica has consumed from it
-     * This can cause a replica to always be out of sync.
-     */
+    // Note we use the log end offset prior to the read. This ensures that any appends following
+    // the fetch do not prevent a follower from coming into sync.
     val initialHighWatermark = localLog.highWatermark
     val initialLogStartOffset = localLog.logStartOffset
     val initialLogEndOffset = localLog.logEndOffset
     val initialLastStableOffset = localLog.lastStableOffset
-
-    val maxOffsetOpt = fetchIsolation match {
-      case FetchLogEnd => None
-      case FetchHighWatermark => Some(initialHighWatermark)
-      case FetchTxnCommitted => Some(initialLastStableOffset)
-    }
-
-    val fetchedData = localLog.read(fetchOffset, maxBytes, maxOffsetOpt, minOneMessage,
-          includeAbortedTxns = fetchIsolation == FetchTxnCommitted)
+    val fetchedData = localLog.read(fetchOffset, maxBytes, fetchIsolation, minOneMessage)
 
     LogReadInfo(
       fetchedData = fetchedData,
@@ -1042,15 +1083,7 @@ class Partition(val topicPartition: TopicPartition,
                           fetchOnlyFromLeader: Boolean): LogOffsetSnapshot = inReadLock(leaderIsrUpdateLock) {
     // decide whether to only fetch from leader
     val localLog = localLogWithEpochOrException(currentLeaderEpoch, fetchOnlyFromLeader)
-    localLog.offsetSnapshot
-  }
-
-  def fetchOffsetSnapshotOrError(currentLeaderEpoch: Optional[Integer],
-                                 fetchOnlyFromLeader: Boolean): Either[LogOffsetSnapshot, Errors] = {
-    inReadLock(leaderIsrUpdateLock) {
-      getLocalLog(currentLeaderEpoch, fetchOnlyFromLeader)
-        .left.map(_.offsetSnapshot)
-    }
+    localLog.fetchOffsetSnapshot
   }
 
   def legacyFetchOffsetsForTimestamp(timestamp: Long,
@@ -1112,7 +1145,7 @@ class Partition(val topicPartition: TopicPartition,
     * @param offset offset to be used for truncation
     * @param isFuture True iff the truncation should be performed on the future log of this partition
     */
-  def truncateTo(offset: Long, isFuture: Boolean) {
+  def truncateTo(offset: Long, isFuture: Boolean): Unit = {
     // The read lock is needed to prevent the follower replica from being truncated while ReplicaAlterDirThread
     // is executing maybeDeleteAndSwapFutureReplica() to replace follower replica with the future replica.
     inReadLock(leaderIsrUpdateLock) {
@@ -1126,7 +1159,7 @@ class Partition(val topicPartition: TopicPartition,
     * @param newOffset The new offset to start the log with
     * @param isFuture True iff the truncation should be performed on the future log of this partition
     */
-  def truncateFullyAndStartAt(newOffset: Long, isFuture: Boolean) {
+  def truncateFullyAndStartAt(newOffset: Long, isFuture: Boolean): Unit = {
     // The read lock is needed to prevent the follower replica from being truncated while ReplicaAlterDirThread
     // is executing maybeDeleteAndSwapFutureReplica() to replace follower replica with the future replica.
     inReadLock(leaderIsrUpdateLock) {
@@ -1179,7 +1212,7 @@ class Partition(val topicPartition: TopicPartition,
   private def maybeUpdateIsrAndVersion(isr: Set[Int], zkVersionOpt: Option[Int]): Unit = {
     zkVersionOpt match {
       case Some(newVersion) =>
-        inSyncReplicas = isr
+        inSyncReplicaIds = isr
         zkVersion = newVersion
         info("ISR updated to [%s] and zkVersion updated to [%d]".format(isr.mkString(","), zkVersion))
 
@@ -1201,8 +1234,14 @@ class Partition(val topicPartition: TopicPartition,
     partitionString.append("Topic: " + topic)
     partitionString.append("; Partition: " + partitionId)
     partitionString.append("; Leader: " + leaderReplicaIdOpt)
-    partitionString.append("; AllReplicas: " + remoteReplicasMap.keys.mkString(","))
-    partitionString.append("; InSyncReplicas: " + inSyncReplicas.mkString(","))
+    partitionString.append("; Replicas: " + assignmentState.replicas.mkString(","))
+    partitionString.append("; ISR: " + inSyncReplicaIds.mkString(","))
+    assignmentState match {
+      case OngoingReassignmentState(adding, removing, _) =>
+        partitionString.append("; AddingReplicas: " + adding.mkString(","))
+        partitionString.append("; RemovingReplicas: " + removing.mkString(","))
+      case _ =>
+    }
     partitionString.toString
   }
 }

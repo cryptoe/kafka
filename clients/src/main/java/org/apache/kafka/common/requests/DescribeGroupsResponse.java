@@ -33,6 +33,8 @@ import java.util.Set;
 
 public class DescribeGroupsResponse extends AbstractResponse {
 
+    public static final int AUTHORIZED_OPERATIONS_OMITTED = Integer.MIN_VALUE;
+
     /**
      * Possible per-group error codes:
      *
@@ -54,12 +56,14 @@ public class DescribeGroupsResponse extends AbstractResponse {
 
     public static DescribedGroupMember groupMember(
         final String memberId,
+        final String groupInstanceId,
         final String clientId,
         final String clientHost,
         final byte[] assignment,
         final byte[] metadata) {
         return new DescribedGroupMember()
             .setMemberId(memberId)
+            .setGroupInstanceId(groupInstanceId)
             .setClientId(clientId)
             .setClientHost(clientHost)
             .setMemberAssignment(assignment)
@@ -133,7 +137,7 @@ public class DescribeGroupsResponse extends AbstractResponse {
 
     public static DescribedGroup forError(String groupId, Errors error) {
         return groupMetadata(groupId, error, DescribeGroupsResponse.UNKNOWN_STATE, DescribeGroupsResponse.UNKNOWN_PROTOCOL_TYPE,
-                DescribeGroupsResponse.UNKNOWN_PROTOCOL, Collections.emptyList(), Collections.emptySet());
+                DescribeGroupsResponse.UNKNOWN_PROTOCOL, Collections.emptyList(), AUTHORIZED_OPERATIONS_OMITTED);
     }
 
     public static DescribeGroupsResponse fromError(int throttleTimeMs, Errors error, List<String> groupIds) {

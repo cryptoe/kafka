@@ -14,45 +14,33 @@
 
 package kafka.server
 
-import java.util.{Collections, LinkedHashMap, Optional, Properties}
+import java.util
 import java.util.concurrent.{Executors, Future, TimeUnit}
+import java.util.{Collections, LinkedHashMap, Optional, Properties}
 
 import kafka.log.LogConfig
 import kafka.network.RequestChannel.Session
-import kafka.security.auth._
+import kafka.security.authorizer.AclAuthorizer
 import kafka.utils.TestUtils
-import org.apache.kafka.common.ElectionType
-import org.apache.kafka.common.Node
-import org.apache.kafka.common.TopicPartition
-import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter, AclOperation, AclPermissionType}
+import org.apache.kafka.common.acl._
 import org.apache.kafka.common.config.ConfigResource
-import org.apache.kafka.common.message.ControlledShutdownRequestData
-import org.apache.kafka.common.message.CreateTopicsRequestData
 import org.apache.kafka.common.message.CreateTopicsRequestData.{CreatableTopic, CreatableTopicCollection}
-import org.apache.kafka.common.message.DeleteTopicsRequestData
-import org.apache.kafka.common.message.DescribeGroupsRequestData
-import org.apache.kafka.common.message.FindCoordinatorRequestData
-import org.apache.kafka.common.message.HeartbeatRequestData
-import org.apache.kafka.common.message.IncrementalAlterConfigsRequestData
-import org.apache.kafka.common.message.InitProducerIdRequestData
-import org.apache.kafka.common.message.JoinGroupRequestData
 import org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocolCollection
-import org.apache.kafka.common.message.LeaveGroupRequestData
-import org.apache.kafka.common.message.OffsetCommitRequestData
-import org.apache.kafka.common.message.SaslAuthenticateRequestData
-import org.apache.kafka.common.message.SaslHandshakeRequestData
-import org.apache.kafka.common.message.SyncGroupRequestData
+import org.apache.kafka.common.message.LeaderAndIsrRequestData.LeaderAndIsrPartitionState
+import org.apache.kafka.common.message.LeaveGroupRequestData.MemberIdentity
+import org.apache.kafka.common.message.UpdateMetadataRequestData.{UpdateMetadataBroker, UpdateMetadataEndpoint, UpdateMetadataPartitionState}
+import org.apache.kafka.common.message._
 import org.apache.kafka.common.metrics.{KafkaMetric, Quota, Sensor}
 import org.apache.kafka.common.network.ListenerName
 import org.apache.kafka.common.protocol.ApiKeys
-import org.apache.kafka.common.protocol.types.Struct
 import org.apache.kafka.common.record._
 import org.apache.kafka.common.requests.CreateAclsRequest.AclCreation
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.resource.{PatternType, ResourcePattern, ResourcePatternFilter, ResourceType => AdminResourceType}
 import org.apache.kafka.common.security.auth.{AuthenticationContext, KafkaPrincipal, KafkaPrincipalBuilder, SecurityProtocol}
-import org.apache.kafka.common.utils.Sanitizer
-import org.apache.kafka.common.utils.SecurityUtils
+import org.apache.kafka.common.utils.{Sanitizer, SecurityUtils}
+import org.apache.kafka.common.{ElectionType, IsolationLevel, Node, TopicPartition}
+import org.apache.kafka.server.authorizer.{Action, AuthorizableRequestContext, AuthorizationResult}
 import org.junit.Assert._
 import org.junit.{After, Before, Test}
 
@@ -89,7 +77,7 @@ class RequestQuotaTest extends BaseRequestTest {
   }
 
   @Before
-  override def setUp() {
+  override def setUp(): Unit = {
     RequestQuotaTest.principal = KafkaPrincipal.ANONYMOUS
     super.setUp()
 
@@ -127,13 +115,13 @@ class RequestQuotaTest extends BaseRequestTest {
   }
 
   @After
-  override def tearDown() {
+  override def tearDown(): Unit = {
     try executor.shutdownNow()
     finally super.tearDown()
   }
 
   @Test
-  def testResponseThrottleTime() {
+  def testResponseThrottleTime(): Unit = {
     for (apiKey <- RequestQuotaTest.ClientActions)
       submitTest(apiKey, () => checkRequestThrottleTime(apiKey))
 
@@ -141,21 +129,19 @@ class RequestQuotaTest extends BaseRequestTest {
   }
 
   @Test
-  def testResponseThrottleTimeWhenBothProduceAndRequestQuotasViolated() {
-    val apiKey = ApiKeys.PRODUCE
-    submitTest(apiKey, () => checkSmallQuotaProducerRequestThrottleTime(apiKey))
+  def testResponseThrottleTimeWhenBothProduceAndRequestQuotasViolated(): Unit = {
+    submitTest(ApiKeys.PRODUCE, () => checkSmallQuotaProducerRequestThrottleTime())
     waitAndCheckResults()
   }
 
   @Test
-  def testResponseThrottleTimeWhenBothFetchAndRequestQuotasViolated() {
-    val apiKey = ApiKeys.FETCH
-    submitTest(apiKey, () => checkSmallQuotaConsumerRequestThrottleTime(apiKey))
+  def testResponseThrottleTimeWhenBothFetchAndRequestQuotasViolated(): Unit = {
+    submitTest(ApiKeys.FETCH, () => checkSmallQuotaConsumerRequestThrottleTime())
     waitAndCheckResults()
   }
 
   @Test
-  def testUnthrottledClient() {
+  def testUnthrottledClient(): Unit = {
     for (apiKey <- RequestQuotaTest.ClientActions)
       submitTest(apiKey, () => checkUnthrottledClient(apiKey))
 
@@ -163,7 +149,7 @@ class RequestQuotaTest extends BaseRequestTest {
   }
 
   @Test
-  def testExemptRequestTime() {
+  def testExemptRequestTime(): Unit = {
     for (apiKey <- RequestQuotaTest.ClusterActions)
       submitTest(apiKey, () => checkExemptRequestMetric(apiKey))
 
@@ -171,7 +157,7 @@ class RequestQuotaTest extends BaseRequestTest {
   }
 
   @Test
-  def testUnauthorizedThrottle() {
+  def testUnauthorizedThrottle(): Unit = {
     RequestQuotaTest.principal = RequestQuotaTest.UnauthorizedPrincipal
 
     for (apiKey <- ApiKeys.values)
@@ -240,20 +226,39 @@ class RequestQuotaTest extends BaseRequestTest {
 
         case ApiKeys.LEADER_AND_ISR =>
           new LeaderAndIsrRequest.Builder(ApiKeys.LEADER_AND_ISR.latestVersion, brokerId, Int.MaxValue, Long.MaxValue,
-            Map(tp -> new LeaderAndIsrRequest.PartitionState(Int.MaxValue, brokerId, Int.MaxValue, List(brokerId).asJava,
-              2, Seq(brokerId).asJava, true)).asJava,
+            Seq(new LeaderAndIsrPartitionState()
+              .setTopicName(tp.topic)
+              .setPartitionIndex(tp.partition)
+              .setControllerEpoch(Int.MaxValue)
+              .setLeader(brokerId)
+              .setLeaderEpoch(Int.MaxValue)
+              .setIsr(List(brokerId).asJava)
+              .setZkVersion(2)
+              .setReplicas(Seq(brokerId).asJava)
+              .setIsNew(true)).asJava,
             Set(new Node(brokerId, "localhost", 0)).asJava)
 
         case ApiKeys.STOP_REPLICA =>
           new StopReplicaRequest.Builder(ApiKeys.STOP_REPLICA.latestVersion, brokerId, Int.MaxValue, Long.MaxValue, true, Set(tp).asJava)
 
         case ApiKeys.UPDATE_METADATA =>
-          val partitionState = Map(tp -> new UpdateMetadataRequest.PartitionState(
-            Int.MaxValue, brokerId, Int.MaxValue, List(brokerId).asJava, 2, Seq(brokerId).asJava, Seq.empty[Integer].asJava)).asJava
+          val partitionState = Seq(new UpdateMetadataPartitionState()
+            .setTopicName(tp.topic)
+            .setPartitionIndex(tp.partition)
+            .setControllerEpoch(Int.MaxValue)
+            .setLeader(brokerId)
+            .setLeaderEpoch(Int.MaxValue)
+            .setIsr(List(brokerId).asJava)
+            .setZkVersion(2)
+            .setReplicas(Seq(brokerId).asJava)).asJava
           val securityProtocol = SecurityProtocol.PLAINTEXT
-          val brokers = Set(new UpdateMetadataRequest.Broker(brokerId,
-            Seq(new UpdateMetadataRequest.EndPoint("localhost", 0, securityProtocol,
-            ListenerName.forSecurityProtocol(securityProtocol))).asJava, null)).asJava
+          val brokers = Seq(new UpdateMetadataBroker()
+            .setId(brokerId)
+            .setEndpoints(Seq(new UpdateMetadataEndpoint()
+              .setHost("localhost")
+              .setPort(0)
+              .setSecurityProtocol(securityProtocol.id)
+              .setListener(ListenerName.forSecurityProtocol(securityProtocol).value)).asJava)).asJava
           new UpdateMetadataRequest.Builder(ApiKeys.UPDATE_METADATA.latestVersion, brokerId, Int.MaxValue, Long.MaxValue, partitionState, brokers)
 
         case ApiKeys.CONTROLLED_SHUTDOWN =>
@@ -322,9 +327,10 @@ class RequestQuotaTest extends BaseRequestTest {
 
         case ApiKeys.LEAVE_GROUP =>
           new LeaveGroupRequest.Builder(
-            new LeaveGroupRequestData()
-              .setGroupId("test-leave-group")
-              .setMemberId(JoinGroupRequest.UNKNOWN_MEMBER_ID)
+            "test-leave-group",
+            Collections.singletonList(
+              new MemberIdentity()
+                .setMemberId(JoinGroupRequest.UNKNOWN_MEMBER_ID))
           )
 
         case ApiKeys.SYNC_GROUP =>
@@ -340,7 +346,7 @@ class RequestQuotaTest extends BaseRequestTest {
           new DescribeGroupsRequest.Builder(new DescribeGroupsRequestData().setGroups(List("test-group").asJava))
 
         case ApiKeys.LIST_GROUPS =>
-          new ListGroupsRequest.Builder()
+          new ListGroupsRequest.Builder(new ListGroupsRequestData())
 
         case ApiKeys.SASL_HANDSHAKE =>
           new SaslHandshakeRequest.Builder(new SaslHandshakeRequestData().setMechanism("PLAIN"))
@@ -349,7 +355,7 @@ class RequestQuotaTest extends BaseRequestTest {
           new SaslAuthenticateRequest.Builder(new SaslAuthenticateRequestData().setAuthBytes(new Array[Byte](0)))
 
         case ApiKeys.API_VERSIONS =>
-          new ApiVersionsRequest.Builder
+          new ApiVersionsRequest.Builder()
 
         case ApiKeys.CREATE_TOPICS => {
           new CreateTopicsRequest.Builder(
@@ -391,8 +397,16 @@ class RequestQuotaTest extends BaseRequestTest {
           new WriteTxnMarkersRequest.Builder(List.empty.asJava)
 
         case ApiKeys.TXN_OFFSET_COMMIT =>
-          new TxnOffsetCommitRequest.Builder("test-transactional-id", "test-txn-group", 2, 0,
-            Map.empty[TopicPartition, TxnOffsetCommitRequest.CommittedOffset].asJava)
+          new TxnOffsetCommitRequest.Builder(
+            new TxnOffsetCommitRequestData()
+              .setTransactionalId("test-transactional-id")
+              .setGroupId("test-txn-group")
+              .setProducerId(2)
+              .setProducerEpoch(0)
+              .setTopics(TxnOffsetCommitRequest.getTopics(
+                Map.empty[TopicPartition, TxnOffsetCommitRequest.CommittedOffset].asJava
+              ))
+          )
 
         case ApiKeys.DESCRIBE_ACLS =>
           new DescribeAclsRequest.Builder(AclBindingFilter.ANY)
@@ -429,19 +443,32 @@ class RequestQuotaTest extends BaseRequestTest {
           )
 
         case ApiKeys.CREATE_DELEGATION_TOKEN =>
-          new CreateDelegationTokenRequest.Builder(Collections.singletonList(SecurityUtils.parseKafkaPrincipal("User:test")), 1000)
+          new CreateDelegationTokenRequest.Builder(
+              new CreateDelegationTokenRequestData()
+                .setRenewers(Collections.singletonList(new CreateDelegationTokenRequestData.CreatableRenewers()
+                .setPrincipalType("User")
+                .setPrincipalName("test")))
+                .setMaxLifetimeMs(1000)
+          )
 
         case ApiKeys.EXPIRE_DELEGATION_TOKEN =>
-          new ExpireDelegationTokenRequest.Builder("".getBytes, 1000)
+          new ExpireDelegationTokenRequest.Builder(
+              new ExpireDelegationTokenRequestData()
+                .setHmac("".getBytes)
+                .setExpiryTimePeriodMs(1000L))
 
         case ApiKeys.DESCRIBE_DELEGATION_TOKEN =>
           new DescribeDelegationTokenRequest.Builder(Collections.singletonList(SecurityUtils.parseKafkaPrincipal("User:test")))
 
         case ApiKeys.RENEW_DELEGATION_TOKEN =>
-          new RenewDelegationTokenRequest.Builder("".getBytes, 1000)
+          new RenewDelegationTokenRequest.Builder(
+              new RenewDelegationTokenRequestData()
+                .setHmac("".getBytes)
+                .setRenewPeriodMs(1000L))
 
         case ApiKeys.DELETE_GROUPS =>
-          new DeleteGroupsRequest.Builder(Collections.singleton("test-group"))
+          new DeleteGroupsRequest.Builder(new DeleteGroupsRequestData()
+            .setGroupsNames(Collections.singletonList("test-group")))
 
         case ApiKeys.ELECT_LEADERS =>
           new ElectLeadersRequest.Builder(
@@ -454,6 +481,27 @@ class RequestQuotaTest extends BaseRequestTest {
           new IncrementalAlterConfigsRequest.Builder(
             new IncrementalAlterConfigsRequestData())
 
+        case ApiKeys.ALTER_PARTITION_REASSIGNMENTS =>
+          new AlterPartitionReassignmentsRequest.Builder(
+            new AlterPartitionReassignmentsRequestData()
+          )
+
+        case ApiKeys.LIST_PARTITION_REASSIGNMENTS =>
+          new ListPartitionReassignmentsRequest.Builder(
+            new ListPartitionReassignmentsRequestData()
+          )
+
+        case ApiKeys.OFFSET_DELETE =>
+          new OffsetDeleteRequest.Builder(
+            new OffsetDeleteRequestData()
+              .setGroupId("test-group")
+              .setTopics(new OffsetDeleteRequestData.OffsetDeleteRequestTopicCollection(
+                Collections.singletonList(new OffsetDeleteRequestData.OffsetDeleteRequestTopic()
+                  .setName("test-topic")
+                  .setPartitions(Collections.singletonList(
+                    new OffsetDeleteRequestData.OffsetDeleteRequestPartition()
+                      .setPartitionIndex(0)))).iterator())))
+
         case _ =>
           throw new IllegalArgumentException("Unsupported API key " + apiKey)
     }
@@ -461,15 +509,15 @@ class RequestQuotaTest extends BaseRequestTest {
 
   case class Client(clientId: String, apiKey: ApiKeys) {
     var correlationId: Int = 0
-    val builder = requestBuilder(apiKey)
-    def runUntil(until: (Struct) => Boolean): Boolean = {
+    def runUntil(until: AbstractResponse => Boolean): Boolean = {
       val startMs = System.currentTimeMillis
       var done = false
       val socket = connect()
       try {
         while (!done && System.currentTimeMillis < startMs + 10000) {
           correlationId += 1
-          val response = requestResponse(socket, clientId, correlationId, builder)
+          val request = requestBuilder(apiKey).build()
+          val response = sendAndReceive[AbstractResponse](request, socket, clientId, Some(correlationId))
           done = until.apply(response)
         }
       } finally {
@@ -488,16 +536,16 @@ class RequestQuotaTest extends BaseRequestTest {
     }
   }
 
-  private def submitTest(apiKey: ApiKeys, test: () => Unit) {
+  private def submitTest(apiKey: ApiKeys, test: () => Unit): Unit = {
     val future = executor.submit(new Runnable() {
-      def run() {
+      def run(): Unit = {
         test.apply()
       }
     })
     tasks += Task(apiKey, future)
   }
 
-  private def waitAndCheckResults() {
+  private def waitAndCheckResults(): Unit = {
     for (task <- tasks) {
       try {
         task.future.get(15, TimeUnit.SECONDS)
@@ -510,76 +558,23 @@ class RequestQuotaTest extends BaseRequestTest {
     }
   }
 
-  private def responseThrottleTime(apiKey: ApiKeys, response: Struct): Int = {
-    apiKey match {
-      case ApiKeys.PRODUCE => new ProduceResponse(response).throttleTimeMs
-      case ApiKeys.FETCH => FetchResponse.parse(response).throttleTimeMs
-      case ApiKeys.LIST_OFFSETS => new ListOffsetResponse(response).throttleTimeMs
-      case ApiKeys.METADATA =>
-        new MetadataResponse(response, ApiKeys.DESCRIBE_GROUPS.latestVersion).throttleTimeMs
-      case ApiKeys.OFFSET_COMMIT =>
-        new OffsetCommitResponse(response, ApiKeys.OFFSET_COMMIT.latestVersion).throttleTimeMs
-      case ApiKeys.OFFSET_FETCH => new OffsetFetchResponse(response).throttleTimeMs
-      case ApiKeys.FIND_COORDINATOR =>
-        new FindCoordinatorResponse(response, ApiKeys.FIND_COORDINATOR.latestVersion).throttleTimeMs
-      case ApiKeys.JOIN_GROUP => new JoinGroupResponse(response).throttleTimeMs
-      case ApiKeys.HEARTBEAT => new HeartbeatResponse(response, ApiKeys.HEARTBEAT.latestVersion).throttleTimeMs
-      case ApiKeys.LEAVE_GROUP => new LeaveGroupResponse(response).throttleTimeMs
-      case ApiKeys.SYNC_GROUP => new SyncGroupResponse(response).throttleTimeMs
-      case ApiKeys.DESCRIBE_GROUPS =>
-        new DescribeGroupsResponse(response, ApiKeys.DESCRIBE_GROUPS.latestVersion).throttleTimeMs
-      case ApiKeys.LIST_GROUPS => new ListGroupsResponse(response).throttleTimeMs
-      case ApiKeys.API_VERSIONS => new ApiVersionsResponse(response).throttleTimeMs
-      case ApiKeys.CREATE_TOPICS =>
-        new CreateTopicsResponse(response, ApiKeys.CREATE_TOPICS.latestVersion).throttleTimeMs
-      case ApiKeys.DELETE_TOPICS => 
-        new DeleteTopicsResponse(response, ApiKeys.DELETE_TOPICS.latestVersion).throttleTimeMs
-      case ApiKeys.DELETE_RECORDS => new DeleteRecordsResponse(response).throttleTimeMs
-      case ApiKeys.INIT_PRODUCER_ID => new InitProducerIdResponse(response, ApiKeys.INIT_PRODUCER_ID.latestVersion).throttleTimeMs
-      case ApiKeys.ADD_PARTITIONS_TO_TXN => new AddPartitionsToTxnResponse(response).throttleTimeMs
-      case ApiKeys.ADD_OFFSETS_TO_TXN => new AddOffsetsToTxnResponse(response).throttleTimeMs
-      case ApiKeys.END_TXN => new EndTxnResponse(response).throttleTimeMs
-      case ApiKeys.TXN_OFFSET_COMMIT => new TxnOffsetCommitResponse(response).throttleTimeMs
-      case ApiKeys.DESCRIBE_ACLS => new DescribeAclsResponse(response).throttleTimeMs
-      case ApiKeys.CREATE_ACLS => new CreateAclsResponse(response).throttleTimeMs
-      case ApiKeys.DELETE_ACLS => new DeleteAclsResponse(response).throttleTimeMs
-      case ApiKeys.DESCRIBE_CONFIGS => new DescribeConfigsResponse(response).throttleTimeMs
-      case ApiKeys.ALTER_CONFIGS => new AlterConfigsResponse(response).throttleTimeMs
-      case ApiKeys.ALTER_REPLICA_LOG_DIRS => new AlterReplicaLogDirsResponse(response).throttleTimeMs
-      case ApiKeys.DESCRIBE_LOG_DIRS => new DescribeLogDirsResponse(response).throttleTimeMs
-      case ApiKeys.CREATE_PARTITIONS => new CreatePartitionsResponse(response).throttleTimeMs
-      case ApiKeys.CREATE_DELEGATION_TOKEN => new CreateDelegationTokenResponse(response).throttleTimeMs
-      case ApiKeys.DESCRIBE_DELEGATION_TOKEN=> new DescribeDelegationTokenResponse(response).throttleTimeMs
-      case ApiKeys.EXPIRE_DELEGATION_TOKEN => new ExpireDelegationTokenResponse(response).throttleTimeMs
-      case ApiKeys.RENEW_DELEGATION_TOKEN => new RenewDelegationTokenResponse(response).throttleTimeMs
-      case ApiKeys.DELETE_GROUPS => new DeleteGroupsResponse(response).throttleTimeMs
-      case ApiKeys.OFFSET_FOR_LEADER_EPOCH => new OffsetsForLeaderEpochResponse(response).throttleTimeMs
-      case ApiKeys.ELECT_LEADERS => new ElectLeadersResponse(response).throttleTimeMs
-      case ApiKeys.INCREMENTAL_ALTER_CONFIGS =>
-        new IncrementalAlterConfigsResponse(response, ApiKeys.INCREMENTAL_ALTER_CONFIGS.latestVersion()).throttleTimeMs
-      case requestId => throw new IllegalArgumentException(s"No throttle time for $requestId")
-    }
-  }
-
-  private def checkRequestThrottleTime(apiKey: ApiKeys) {
+  private def checkRequestThrottleTime(apiKey: ApiKeys): Unit = {
 
     // Request until throttled using client-id with default small quota
     val clientId = apiKey.toString
     val client = Client(clientId, apiKey)
 
-    val throttled = client.runUntil(response =>
-      responseThrottleTime(apiKey, response) > 0
-    )
+    val throttled = client.runUntil(_.throttleTimeMs > 0)
 
     assertTrue(s"Response not throttled: $client", throttled)
     assertTrue(s"Throttle time metrics not updated: $client" , throttleTimeMetricValue(clientId) > 0)
   }
 
-  private def checkSmallQuotaProducerRequestThrottleTime(apiKey: ApiKeys) {
+  private def checkSmallQuotaProducerRequestThrottleTime(): Unit = {
 
     // Request until throttled using client-id with default small producer quota
-    val smallQuotaProducerClient = Client(smallQuotaProducerClientId, apiKey)
-    val throttled = smallQuotaProducerClient.runUntil(response => responseThrottleTime(apiKey, response) > 0)
+    val smallQuotaProducerClient = Client(smallQuotaProducerClientId, ApiKeys.PRODUCE)
+    val throttled = smallQuotaProducerClient.runUntil(_.throttleTimeMs > 0)
 
     assertTrue(s"Response not throttled: $smallQuotaProducerClient", throttled)
     assertTrue(s"Throttle time metrics for produce quota not updated: $smallQuotaProducerClient",
@@ -588,11 +583,11 @@ class RequestQuotaTest extends BaseRequestTest {
       throttleTimeMetricValueForQuotaType(smallQuotaProducerClientId, QuotaType.Request).isNaN)
   }
 
-  private def checkSmallQuotaConsumerRequestThrottleTime(apiKey: ApiKeys) {
+  private def checkSmallQuotaConsumerRequestThrottleTime(): Unit = {
 
     // Request until throttled using client-id with default small consumer quota
-    val smallQuotaConsumerClient =   Client(smallQuotaConsumerClientId, apiKey)
-    val throttled = smallQuotaConsumerClient.runUntil(response => responseThrottleTime(apiKey, response) > 0)
+    val smallQuotaConsumerClient =   Client(smallQuotaConsumerClientId, ApiKeys.FETCH)
+    val throttled = smallQuotaConsumerClient.runUntil(_.throttleTimeMs > 0)
 
     assertTrue(s"Response not throttled: $smallQuotaConsumerClientId", throttled)
     assertTrue(s"Throttle time metrics for consumer quota not updated: $smallQuotaConsumerClient",
@@ -601,16 +596,16 @@ class RequestQuotaTest extends BaseRequestTest {
       throttleTimeMetricValueForQuotaType(smallQuotaConsumerClientId, QuotaType.Request).isNaN)
   }
 
-  private def checkUnthrottledClient(apiKey: ApiKeys) {
+  private def checkUnthrottledClient(apiKey: ApiKeys): Unit = {
 
     // Test that request from client with large quota is not throttled
     val unthrottledClient = Client(unthrottledClientId, apiKey)
-    unthrottledClient.runUntil(response => responseThrottleTime(apiKey, response) <= 0.0)
+    unthrottledClient.runUntil(_.throttleTimeMs <= 0.0)
     assertEquals(1, unthrottledClient.correlationId)
     assertTrue(s"Client should not have been throttled: $unthrottledClient", throttleTimeMetricValue(unthrottledClientId).isNaN)
   }
 
-  private def checkExemptRequestMetric(apiKey: ApiKeys) {
+  private def checkExemptRequestMetric(apiKey: ApiKeys): Unit = {
     val exemptTarget = exemptRequestMetricValue + 0.02
     val clientId = apiKey.toString
     val client = Client(clientId, apiKey)
@@ -620,7 +615,7 @@ class RequestQuotaTest extends BaseRequestTest {
     assertTrue(s"Client should not have been throttled: $client", throttleTimeMetricValue(clientId).isNaN)
   }
 
-  private def checkUnauthorizedRequestThrottle(apiKey: ApiKeys) {
+  private def checkUnauthorizedRequestThrottle(apiKey: ApiKeys): Unit = {
     val clientId = "unauthorized-" + apiKey.toString
     val client = Client(clientId, apiKey)
     val throttled = client.runUntil(response => throttleTimeMetricValue(clientId) > 0.0)
@@ -637,9 +632,11 @@ object RequestQuotaTest {
   // Principal used for all client connections. This is modified by tests which
   // check unauthorized code path
   var principal = KafkaPrincipal.ANONYMOUS
-  class TestAuthorizer extends SimpleAclAuthorizer {
-    override def authorize(session: Session, operation: Operation, resource: Resource): Boolean = {
-      session.principal != UnauthorizedPrincipal
+  class TestAuthorizer extends AclAuthorizer {
+    override def authorize(requestContext: AuthorizableRequestContext, actions: util.List[Action]): util.List[AuthorizationResult] = {
+      actions.asScala.map { _ =>
+        if (requestContext.principal != UnauthorizedPrincipal) AuthorizationResult.ALLOWED else AuthorizationResult.DENIED
+      }.asJava
     }
   }
   class TestPrincipalBuilder extends KafkaPrincipalBuilder {

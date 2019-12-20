@@ -144,6 +144,10 @@ class CachedPartition(val topic: String,
       if (updateResponseData)
         localLogStartOffset = respData.logStartOffset
     }
+    if (respData.preferredReadReplica.isPresent) {
+      // If the broker computed a preferred read replica, we need to include it in the response
+      mustRespond = true
+    }
     if (respData.error.code != 0) {
       // Partitions with errors are always included in the response.
       // We also set the cached highWatermark to an invalid offset, -1.
@@ -261,7 +265,7 @@ case class FetchSession(val id: Int,
       ", privileged=" + privileged +
       ", partitionMap.size=" + partitionMap.size +
       ", creationMs=" + creationMs +
-      ", creationMs=" + lastUsedMs +
+      ", lastUsedMs=" + lastUsedMs +
       ", epoch=" + epoch + ")"
   }
 }
@@ -777,11 +781,7 @@ class FetchManager(private val time: Time,
                 cache.remove(session)
                 new SessionlessFetchContext(fetchData)
               } else {
-                if (session.size != session.cachedSize) {
-                  // If the number of partitions in the session changed, update the session's
-                  // position in the cache.
-                  cache.touch(session, session.lastUsedMs)
-                }
+                cache.touch(session, time.milliseconds())
                 session.epoch = JFetchMetadata.nextEpoch(session.epoch)
                 debug(s"Created a new incremental FetchContext for session id ${session.id}, " +
                   s"epoch ${session.epoch}: added ${partitionsToLogString(added)}, " +

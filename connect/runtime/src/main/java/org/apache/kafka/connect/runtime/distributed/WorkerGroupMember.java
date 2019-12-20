@@ -96,7 +96,7 @@ public class WorkerGroupMember {
             List<InetSocketAddress> addresses = ClientUtils.parseAndValidateAddresses(
                     config.getList(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG),
                     config.getString(CommonClientConfigs.CLIENT_DNS_LOOKUP_CONFIG));
-            this.metadata.bootstrap(addresses, time.milliseconds());
+            this.metadata.bootstrap(addresses);
             String metricGrpPrefix = "connect";
             ChannelBuilder channelBuilder = ClientUtils.createChannelBuilder(config, time);
             NetworkClient netClient = new NetworkClient(
@@ -151,6 +151,10 @@ public class WorkerGroupMember {
         stop(false);
     }
 
+    /**
+     * Ensure that the connection to the broker coordinator is up and that the worker is an
+     * active member of the group.
+     */
     public void ensureActive() {
         coordinator.poll(0);
     }
@@ -183,8 +187,8 @@ public class WorkerGroupMember {
         coordinator.requestRejoin();
     }
 
-    public void maybeLeaveGroup() {
-        coordinator.maybeLeaveGroup();
+    public void maybeLeaveGroup(String leaveReason) {
+        coordinator.maybeLeaveGroup(leaveReason);
     }
 
     public String ownerUrl(String connector) {
